@@ -9,38 +9,36 @@ import os
 import glob
 import zipfile
 
-# --- 1. File and Directory Setup ---
-# Upload modelnet40.zip and unzip
-uploaded = files.upload()
+# =========================
+# 1. File and Directory Setup
+# =========================
+DATASET_DIR = "data/modelnet40"
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-os.makedirs('/content/data/modelnet40', exist_ok=True)
-with zipfile.ZipFile('modelnet40.zip', 'r') as zip_ref:
-    zip_ref.extractall('/content/data')
-
-# Verify structure
-!ls /content/data/modelnet40
-
-# --- 2. Install Dependencies and Hyperparameter Configuration ---
-!pip install torch==2.5.1 torchvision==0.20.1 numpy scikit-image scipy
-!pip install open3d
-
+# =========================
+# 2. Device + Hyperparameters
+# =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 latent_dim = 256
 hidden_dim = 512
 message_length = 128
 num_points = 1024
-batch_size = 16  # Reduced batch size for 16GB GPU
-epochs = 1000
+batch_size = 16
+epochs = 10
 lr_generator = 1e-4
 lr_discriminator = 1e-4
-max_iter_lbfgs = 200 # Reduced L-BFGS iterations for efficiency
-checkpoint_dir = "/content/checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
+stego_optimization_steps = 200
+stego_lr = 0.03
 
-# --- 3. Model Architecture and Helper Functions ---
+# =========================
+# 3. Model Architectures
+# =========================
 class FunctionGenerator(nn.Module):
     def __init__(self, latent_dim=256, hidden_dim=512, output_dim=3):
         super(FunctionGenerator, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
@@ -70,13 +68,13 @@ class Discriminator(nn.Module):
         return self.mlp(point_cloud).mean(dim=1)
 
 def r1_regularization(discriminator, real_points):
-    # Select a random subset of points to reduce memory
     if real_points.size(1) > 1024:
-        indices = torch.randperm(real_points.size(1))[:1024]
+        indices = torch.randperm(real_points.size(1))[:1024].to(real_points.device)
         real_points = real_points[:, indices, :]
+    
     real_points.requires_grad_(True)
     real_out = discriminator(real_points)
-    grad = torch.autograd.grad(outputs=real_out.sum(), inputs=real_points, create_graph=True)[0]
+    grad = torch.autograd.grad(outputs=real_out.sum(), inputs=real_points, create_graph=True, retain_graph=True)[0]
     r1_loss = 0.5 * (grad.norm(2, dim=-1) ** 2).mean()
     return r1_loss
 
@@ -86,7 +84,7 @@ class PointConv(nn.Module):
         self.conv = nn.Conv1d(in_channels, out_channels, 1)
         self.bn = nn.BatchNorm1d(out_channels)
 
-    def forward(self, x, coords):
+    def forward(self, x):
         x = self.conv(x)
         x = self.bn(x)
         return F.relu(x)
@@ -100,11 +98,14 @@ class PointCloudMessageExtractor(nn.Module):
 
     def forward(self, point_cloud):
         x = point_cloud.permute(0, 2, 1)
-        x = self.conv1(x, point_cloud)
-        x = self.conv2(x, point_cloud)
+        x = self.conv1(x)
+        x = self.conv2(x)
         x = x.mean(dim=2)
         return torch.sigmoid(self.fc(x))
 
+# =========================
+# 4. Helper Functions
+# =========================
 def random_fourier_features(coords, num_features=256):
     B = torch.randn(coords.shape[-1], num_features // 2, device=coords.device) * 10
     coords = coords @ B
@@ -118,47 +119,66 @@ def generate_point_cloud(data, num_points=1024):
     b, n, d = data.shape
     coords = data[:, :, :3]
     values = data[:, :, :3]
-    indices = torch.randperm(coords.shape[1])[:num_points]
+    indices = torch.randperm(coords.shape[1])[:num_points].to(coords.device)
     return coords[:, indices], values[:, indices]
 
-def optimize_point_cloud(point_cloud, secret_msg, extractor, max_iter=200):
-    point_cloud = point_cloud.clone().requires_grad_(True)
-    optimizer = torch.optim.LBFGS([point_cloud], lr=0.03, max_iter=max_iter)
+def optimize_point_cloud(point_cloud, secret_msg, extractor, steps=200, lr=0.03):
+    point_cloud = point_cloud.clone().detach().requires_grad_(True)
+    optimizer = torch.optim.Adam([point_cloud], lr=lr)
 
-    def closure():
+    for _ in range(steps):
         optimizer.zero_grad()
         ext_msg = extractor(point_cloud)
         loss = F.binary_cross_entropy(ext_msg, secret_msg)
         loss.backward()
-        return loss
-
-    optimizer.step(closure)
+        optimizer.step()
     return point_cloud.detach()
 
-# --- 4. Dataset, Dataloader and Model Instantiation ---
+# =========================
+# 5. Dataset Loader
+# =========================
 class ModelNet40Dataset(Dataset):
     def __init__(self, root_dir, split='train'):
-        self.files = glob.glob(os.path.join(root_dir, '**', split, '*.off'), recursive=True)
+        self.files = glob.glob(os.path.join(root_dir, '*', split, '*.off'))
         if not self.files:
-            raise FileNotFoundError(f"No .off files found in {os.path.join(root_dir, '**', split)}")
+            raise FileNotFoundError(f"No .off files found in {root_dir}")
+        self.num_files = len(self.files)
 
     def __len__(self):
-        return len(self.files)
+        return self.num_files
 
     def __getitem__(self, idx):
-        path = self.files[idx]
-        point_cloud = o3d.io.read_point_cloud(path)
-        points = np.asarray(point_cloud.points)
-        if len(points) < 1024:
-            # Pad with zeros if point cloud is too small
-            padded_points = np.zeros((1024, 3), dtype=np.float32)
-            padded_points[:len(points), :] = points
-            points = padded_points
-        points = (points - points.min()) / (points.max() - points.min()) * 2 - 1
-        return torch.tensor(points, dtype=torch.float32)
+        file_path = self.files[idx]
+        attempts = 0
+        while attempts < self.num_files:
+            try:
+                mesh = o3d.io.read_triangle_mesh(file_path)
 
+                if not mesh.has_vertices() or not mesh.has_triangles():
+                    raise ValueError("Mesh has no vertices or triangles.")
+
+                points = mesh.sample_points_uniformly(number_of_points=num_points)
+                points = np.asarray(points.points, dtype=np.float32)
+                points_min = points.min(axis=0)
+                points_max = points.max(axis=0)
+                points = 2 * (points - points_min) / (points_max - points_min + 1e-8) - 1
+                
+                return torch.from_numpy(points)
+            except Exception as e:
+                print(f"Error loading file {file_path}: {e}. Skipping...")
+                idx = (idx + 1) % self.num_files
+                file_path = self.files[idx]
+                attempts += 1
+        
+        # If all files fail after trying them all, raise a final error.
+        raise RuntimeError("Could not find a single valid file in the dataset.")
+
+
+# =========================
+# 6. Data + Models
+# =========================
 try:
-    dataset = ModelNet40Dataset('/content/data/modelnet40', split='train')
+    dataset = ModelNet40Dataset(DATASET_DIR, split='train')
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 except FileNotFoundError as e:
     print(e)
@@ -174,12 +194,11 @@ opt_d = optim.Adam(discriminator.parameters(), lr=lr_discriminator)
 torch.manual_seed(42)
 extractor.eval()
 
-# Checkpoint loading logic
 start_epoch = 0
-checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+checkpoint_path = os.path.join(CHECKPOINT_DIR, 'checkpoint.pth')
 if os.path.exists(checkpoint_path):
     print("Loading checkpoint...")
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     generator.load_state_dict(checkpoint['generator_state_dict'])
     discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
     opt_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
@@ -187,49 +206,49 @@ if os.path.exists(checkpoint_path):
     start_epoch = checkpoint['epoch'] + 1
     print(f"Resuming training from epoch {start_epoch}")
 
-# --- 5. Training Loop ---
+# =========================
+# 7. Training Loop
+# =========================
 for epoch in range(start_epoch, epochs):
     for i, real_points in enumerate(dataloader):
         real_points = real_points.to(device)
-        batch_size = real_points.shape[0]
-
         if real_points.numel() == 0:
             continue
 
+        current_batch_size = real_points.shape[0]
         coords, real_values = generate_point_cloud(real_points, num_points)
-
-        # Train Discriminator
+        
         opt_d.zero_grad()
-        z = torch.randn(batch_size, latent_dim, device=device)
+        z = torch.randn(current_batch_size, latent_dim, device=device)
         gen_values = generator(z, random_fourier_features(coords.detach()))
+        
         real_out = discriminator(real_values)
         gen_out = discriminator(gen_values.detach())
         d_loss = F.binary_cross_entropy(real_out, torch.ones_like(real_out)) + \
                  F.binary_cross_entropy(gen_out, torch.zeros_like(gen_out))
-        r1_loss = r1_regularization(discriminator, real_values)
-        d_loss = d_loss + 10 * r1_loss
+        
+        r1_loss_val = r1_regularization(discriminator, real_values)
+        d_loss = d_loss + 10 * r1_loss_val
         d_loss.backward()
         opt_d.step()
 
-        # Train Generator
         opt_g.zero_grad()
-        z = torch.randn(batch_size, latent_dim, device=device)
+        z = torch.randn(current_batch_size, latent_dim, device=device)
         gen_values = generator(z, random_fourier_features(coords))
         gen_out = discriminator(gen_values)
         g_loss = F.binary_cross_entropy(gen_out, torch.ones_like(gen_out))
         g_loss.backward()
         opt_g.step()
 
-        # Steganography Process
-        secret_msg = (torch.rand(batch_size, message_length, device=device) > 0.5).float()
-        stego_points = optimize_point_cloud(real_values.clone(), secret_msg, extractor, max_iter=max_iter_lbfgs)
+        secret_msg = (torch.rand(current_batch_size, message_length, device=device) > 0.5).float()
+        stego_points = optimize_point_cloud(real_values.clone(), secret_msg, extractor, steps=stego_optimization_steps, lr=stego_lr)
         ext_msg = extractor(stego_points)
         accuracy = compute_accuracy(secret_msg, ext_msg)
 
         if (i + 1) % 10 == 0:
-            print(f"Epoch [{epoch + 1}/{epochs}], Step [{i + 1}/{len(dataloader)}], D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}, Accuracy: {accuracy.item():.4f}")
+            print(f"Epoch [{epoch + 1}/{epochs}], Step [{i + 1}/{len(dataloader)}], "
+                  f"D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}, Accuracy: {accuracy.item():.4f}")
 
-    # Save checkpoint at the end of each epoch
     torch.save({
         'epoch': epoch,
         'generator_state_dict': generator.state_dict(),
@@ -239,42 +258,51 @@ for epoch in range(start_epoch, epochs):
     }, checkpoint_path)
     print(f"Checkpoint saved at epoch {epoch + 1}")
 
-# --- 6. Save and Download Final Models ---
-torch.save(generator.state_dict(), "/content/generator.pth")
-torch.save(discriminator.state_dict(), "/content/discriminator.pth")
+# =========================
+# 8. Save Final Models
+# =========================
+torch.save(generator.state_dict(), "generator.pth")
+torch.save(discriminator.state_dict(), "discriminator.pth")
 
-files.download('/content/generator.pth')
-files.download('/content/discriminator.pth')
+# =========================
+# 9. Evaluation
+# =========================
+print("Running final evaluation...")
+try:
+    test_dataset = ModelNet40Dataset(DATASET_DIR, split='test')
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    accuracies = []
 
-# --- 7. Evaluation and Visualization (Optional) ---
+    generator.eval()
+    extractor.eval()
+    with torch.no_grad():
+        for real_points in test_dataloader:
+            real_points = real_points.to(device)
+            if real_points.numel() == 0:
+                continue
+            
+            coords, real_values = generate_point_cloud(real_points, num_points)
+            secret_msg = (torch.rand(real_points.shape[0], message_length, device=device) > 0.5).float()
+            
+            stego_points = optimize_point_cloud(real_values.clone(), secret_msg, extractor, steps=stego_optimization_steps, lr=stego_lr)
+            ext_msg = extractor(stego_points)
+            accuracy = compute_accuracy(secret_msg, ext_msg)
+            accuracies.append(accuracy.item())
+
+    print(f"Average Accuracy: {sum(accuracies) / len(accuracies):.4f}")
+except FileNotFoundError as e:
+    print(f"Skipping evaluation: {e}")
+
+# =========================
+# 10. Visualization (requires an interactive environment)
+# =========================
 def visualize_point_cloud(points):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
     o3d.visualization.draw_geometries([pcd])
 
-print("Running final evaluation...")
-generator.eval()
-extractor.eval()
-test_dataset = ModelNet40Dataset('/content/data/modelnet40', split='test')
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-accuracies = []
-
-with torch.no_grad():
-    for real_points in test_dataloader:
-        real_points = real_points.to(device)
-        if real_points.numel() == 0:
-            continue
-
-        coords, real_values = generate_point_cloud(real_points, num_points)
-        secret_msg = (torch.rand(real_points.shape[0], message_length, device=device) > 0.5).float()
-
-        stego_points = optimize_point_cloud(real_values.clone(), secret_msg, extractor, max_iter=max_iter_lbfgs)
-        ext_msg = extractor(stego_points)
-        accuracy = compute_accuracy(secret_msg, ext_msg)
-        accuracies.append(accuracy.item())
-
-print(f"Average Accuracy: {sum(accuracies) / len(accuracies):.4f}")
-
-if len(stego_points) > 0:
-    print("Visualizing a sample stego-point cloud...")
-    visualize_point_cloud(stego_points[0])
+# The following visualization code will only work in a graphical environment,
+# which is not available in most remote or terminal setups.
+# if 'stego_points' in locals() and len(stego_points) > 0:
+#     print("Visualizing a sample stego-point cloud...")
+#     visualize_point_cloud(stego_points[0])
